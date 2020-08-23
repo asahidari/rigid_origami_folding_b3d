@@ -1,11 +1,11 @@
 """
-in obj_in o
-in valleys s d=[] n=1
-in valley_angle s d=3.141592 n=2
-in mountains s d=[] n=1
-in mountain_angle s d=3.141592 n=2
+in verts_in v d=[] n=1
+in edges_in s d=[] n=1
+in faces_in s d=[] n=1
+in fold_edge_indices s d=[] n=1
+in fold_edge_angles s d=[] n=1
 in folding s d=0.0 n=2
-in step s d=0.1570796 n=2
+in step s d=20 n=2
 in fixed_face s d=0 n=2
 out verts v
 out edges s
@@ -15,39 +15,84 @@ out faces s
 import numpy as np
 import math
 import copy
+import bmesh
 from collections import deque, defaultdict
+from mathutils import Vector
 from animation_nodes.data_structures import Vector3DList, EdgeIndicesList, PolygonIndicesList
-
+# from sverchok.utils.sv_bmesh_utils import bmesh_from_pydata
         
 # === Object wrapper class ===
 class ObjectParams:
     
     # constructor
-    def __init__(self, obj):
+    def __init__(self, verts, edges, faces):
         
         # get vertices, edges and faces
-        self.verts = np.array([np.array([v.co[0], v.co[1], v.co[2]]) \
-                            for v in obj.data.vertices])
+        self.verts = np.array(verts)
         self.num_verts = len(self.verts)
-        self.edges = [tuple(sorted([e.vertices[0], e.vertices[1]])) \
-                            for e in obj.data.edges]
-        self.faces = obj.data.polygons
+        self.edges = [tuple(sorted([e[0], e[1]])) for e in edges]
+        self.faces = faces
+        
+        self.mesh = bpy.data.meshes.new(name="obj_mesh")
+        self.mesh.from_pydata(verts, self.edges, self.faces)
+        self.bm = bmesh.new()
+        self.bm.from_mesh(self.mesh)
+        self.bm.faces.ensure_lookup_table()
+        self.bm.edges.ensure_lookup_table()
+        self.bm.normal_update()
+    
+    # convert bm edge index to obj edge one
+    def bm_to_obj_edge_index(self, bm_edge):
+        edge = tuple(sorted([bm_edge.verts[0].index, bm_edge.verts[1].index])) 
+        return self.edges.index(edge)
 
+    # convert bm edge index to obj edge one
+    def obj_to_bm_edge_index(self, edge):
+        bm_e_index = -1
+        for bm_e in obj.bm.edges:
+            if len(bm_e.verts) == 2:
+                v0 = bm_e.verts[0].index
+                v1 = bm_e.verts[0].index
+                if v0 in edge and v1 in edge:
+                    bm_e_index = bm_e.index
+                    break
+        return 
+    
+    # convert bm face index to obj face one
+    def bm_to_obj_face_index(self, bm_face):
+        v_indices = [v.index for v in bm_face.verts]
+        for i, f in enumerate(self.faces):
+            if set(f) == set(v_indices):
+                return i
+        raise ValueError("Created BMesh faces is wrong")
+        
 # === Crease Lines class ===
 class CreaseLines:
 
     # constructor
-    def __init__(self, obj_edges, valley_edges, mountain_edges):
-        # select valley/mountain crease lines
-        self.edges = [tuple(e) for e in obj_edges \
-                                if tuple(e) in valley_edges \
-                                or tuple(e) in mountain_edges]
-        # create is_valleys list to check valley or mountain
-        self.is_valleys = [(tuple(e) in valley_edges) \
-                            for e in obj_edges \
-                            if tuple(e) in valley_edges \
-                            or tuple(e) in mountain_edges]
-        self.angles = [0.0] * len(self.edges)
+    def __init__(self, obj, fold_edge_indices, fold_edge_angles, folding):
+        
+        # Collect edges inside of a mesh
+        edge_indices = [obj.bm_to_obj_edge_index(obj.bm.edges[i]) \
+                        for i, e in enumerate(obj.bm.edges) \
+                        if not e.is_boundary]
+        self.edges = [tuple(obj.edges[i]) for i in edge_indices]
+
+        # initial edge angles
+        self.angles = [obj.bm.edges[i].calc_face_angle_signed(0.0) \
+                        for i, e in enumerate(obj.bm.edges) \
+                        if not e.is_boundary]
+                        
+        final_angles = [fold_edge_angles[fold_edge_indices.index(i)] \
+                                if fold_edge_indices.count(i) > 0 else 0.0 \
+                                for i in edge_indices]
+        diffs = [final - angle \
+                    for final, angle in zip(final_angles, self.angles)]
+
+        self.target_angles = [angle + (diff * folding) for angle, diff \
+                                in zip(self.angles, diffs)]
+        
+        self.delta_angles = [0.0] * len(self.angles)
 
 # === Inside Vertex class ===
 class InsideVertex:
@@ -62,92 +107,211 @@ class InsideVertex:
         self.edges = edges
         self.crease_indices = crease_indices
         self.thetas = thetas
+        self.init_rhos = [rho for rho in rhos]
         self.rhos = rhos
         self.drhos = drhos
         
     # function to generate inside vertex objects
     @classmethod
-    def GenerateInsideVertices(cls, obj, crease_edges, \
-                                valley_edges, mountain_edges):
+    def GenerateInsideVertices(cls, obj, crease_lines):
         # create vertex indices
         num_verts = len(obj.verts)
-        indices = cls.__GetInsideVertsIndices(obj)
+        indices = [v.index for v in obj.bm.verts if not v.is_boundary]
+        # indices = cls.__GetInsideVertsIndices(obj)
         InsideVertex.indices = indices
         
         # create list of crease edges around each vertices
-        crease_indices = [cls.__GetCreaseLinesAroundVertex \
-                        (crease_edges, obj.verts, i) for i in indices]
-        cr_edges = [[crease_edges[j] for j in crease_indices[i]] \
+        # crease_indices = [cls.__GetCreaseLinesAroundVertex \
+        #                 (crease_lines.edges, obj.verts, i) for i in indices]
+        # crease_indices = [cls.__GetCreaseLinesAroundVertexEx \
+        #                 (crease_lines, obj, i) for i in indices]
+        crease_indices = cls.__GetCreaseLinesAroundVertex(crease_lines, indices, obj)
+
+        cr_edges = [[crease_lines.edges[j] for j in crease_indices[i]] \
                     for i in range(len(crease_indices))]
-        
+        print("cr_edges:", cr_edges)                    
         # create theta (between edges) and rho (edge angle) list
         theta_list = [cls.__calc_theta_angles(obj.verts, cr_edges[i], idx) \
                         for i, idx in enumerate(indices)]
-        rho_list = [[0.0] * len(crease_indices[i]) \
+        rho_list = [[crease_lines.angles[j] for j in crease_indices[i]] \
                         for i in range(len(indices))]
-        drho_list = [[np.pi*0.5] * len(crease_indices[i]) \
+        drho_list = [[crease_lines.angles[j]+np.pi*0.5 for j in crease_indices[i]] \
                         for i in range(len(indices))]
-        
+        # rho_list = [[0.0] * len(crease_indices[i]) \
+        #                 for i in range(len(indices))]
+        # drho_list = [[np.pi*0.5] * len(crease_indices[i]) \
+        #                 for i in range(len(indices))]
+
         # create list of InsideVertex class
         inside_verts = [InsideVertex(obj.verts[idx], idx, cr_edges[i], \
                         crease_indices[i], theta_list[i], rho_list[i], \
                         drho_list[i]) \
                         for i, idx in enumerate(indices)]
-                        
+
         return inside_verts
     
-    # function to get vertex indices inside of the plane
     @classmethod
-    def __GetInsideVertsIndices(cls, obj):
-        verts_indices = []
-        # Regard a vertex as one inside of the plane
-        # if the count of each edges (around the vertex)
-        # extracted from all faces is '2'
-        for v_idx in range(len(obj.verts)):
-            connected_edges = defaultdict(int)
-            for f in obj.faces:
-                for e in f.edge_keys:
-                    if e.count(v_idx) > 0:
-                        connected_edges[e] += 1
-            if list(connected_edges.values()).count(2) == \
-                len(connected_edges):
-                    verts_indices.append(v_idx)
-        
-        return verts_indices
+    def __GetCreaseLinesAroundVertex(cls, crease_lines, inside_vert_indices, obj):
+
+        # Sort link_edges around each vertices in counter-clockwise order
+        obj.bm.verts.ensure_lookup_table()
+        bm_edges_ccws = []
+        for i in inside_vert_indices:
+            bm_vert = obj.bm.verts[i]
+            bm_vert.link_edges.index_update()
             
-    # function to get crease lines around the vertex
-    @classmethod
-    def __GetCreaseLinesAroundVertex(cls, crease_edges, obj_verts, vertexIndex):
-        iv_edges = [ce for ce in crease_edges if vertexIndex in ce]
-        iv_edges = cls.__SortEdgesCounterclockwise(iv_edges, obj_verts, vertexIndex)
-        iv_e_indices = [i for e in iv_edges \
-                        for i, x in enumerate(crease_edges) if x == e]
-        return iv_e_indices
+            edges_counterclockwise_order = []
+            bm_edge = bm_vert.link_edges[0]
+            while bm_edge not in edges_counterclockwise_order:
+                edges_counterclockwise_order.append(bm_edge)
+                bm_edge = cls.__GetRightSideEdgeAroundVertex(bm_edge, bm_vert, obj)
+            bm_edges_ccws.append(edges_counterclockwise_order)
+            print("bm_edges_ccw:", [obj.edges[obj.bm_to_obj_edge_index(bm_e)] for bm_e in edges_counterclockwise_order])
+            
+        crease_edge_indices = [[] for i in inside_vert_indices]
+        outer_verts_indices = [idx for idx, vert in enumerate(obj.bm.verts) if vert.is_boundary]
+        target_indices = [idx for idx in inside_vert_indices]
+        print("target_indices:", target_indices)
+        print("outer_verts_indices:", outer_verts_indices)
+        
+        while len(target_indices) > 0:
 
-    # sort edges around the vertex in counterclockwise order
-    @classmethod
-    def __SortEdgesCounterclockwise(cls, edges, verts, cv_idx):
-
-        thetas = []
-        for i, e in enumerate(edges):
-            opposite_idx = e[1 if e.index(cv_idx) == 0 else 0]
-            vec = np.array([verts[opposite_idx][0] - verts[cv_idx][0], \
-                   verts[opposite_idx][1] - verts[cv_idx][1], \
-                   verts[opposite_idx][2] - verts[cv_idx][2]])
-            if i == 0:
-                # to be compared with other edges
-                vec0 = vec
-                thetas.append(0)
-            else:
-                # get the angle between vec[current] and vec[0]
-                cos_t = np.inner(vec0, vec)/(np.linalg.norm(vec0)*np.linalg.norm(vec))
-                sin_t = (vec0[0]*vec[1] - vec0[1]*vec[0])/(np.linalg.norm(vec0)*np.linalg.norm(vec))
-                theta = np.arctan2(sin_t, cos_t) if cos_t != 0 else np.arcsin(sin_t)
-                thetas.append(theta)
+            target_list_idx = [inside_vert_indices.index(target_idx) for target_idx in target_indices]
+            target_ccws = [ccw for i, ccw in enumerate(bm_edges_ccws) if i in target_list_idx]
+            indices_outermost = [idx for idx, (target_ccw, v_idx) in \
+                                        enumerate(zip(target_ccws, target_indices)) \
+                                        if any([bme.other_vert(obj.bm.verts[v_idx]).index \
+                                        in outer_verts_indices for bme in target_ccw])]
+                                        
+            # roll crease edges to enable the paper foldable
+            for idx, target_ccw in enumerate(target_ccws):
+                if not idx in indices_outermost:
+                    continue
+                bm_vert = obj.bm.verts[target_indices[idx]]
+                is_candidate = [bm_edge.other_vert(bm_vert).index in outer_verts_indices and \
+                                not target_ccw[(i+1)%len(target_ccw)].other_vert(bm_vert).index in outer_verts_indices \
+                                for i, bm_edge in enumerate(target_ccw)]
                 
-        # sort edges with the angles
-        sorted_edges = [edges[i] for i in np.argsort(thetas)]
-        return sorted_edges
+                top_index = is_candidate.index(True) if is_candidate.count(True) > 0 else 0
+                rolled_bm_e = np.roll(np.array([bm_e for bm_e in target_ccw]), \
+                                    -top_index).tolist()
+                list_index = inside_vert_indices.index(target_indices[idx])
+                crease_edge_indices[list_index] = [crease_lines.edges.index(obj.edges[obj.bm_to_obj_edge_index(bm_e)]) \
+                                            for bm_e in rolled_bm_e \
+                                            if crease_lines.edges.count(obj.edges[obj.bm_to_obj_edge_index(bm_e)]) > 0]
+                
+            # remove indices with edges rolled this time
+            new_outmost_indices = [target_indices[i] for i in indices_outermost]
+            target_indices = [idx for i, idx in enumerate(target_indices) if not i in indices_outermost]
+            outer_verts_indices.extend(new_outmost_indices)
+        
+        print("crease_edges per verts(new func):", [[crease_lines.edges[i] for i in ce_indices] for ce_indices in crease_edge_indices])
+        return crease_edge_indices
+        """
+        # Divide inside verts into verts near boundary and deep inside
+        indices_near_boundary = [idx for idx, (bm_edges_ccw, v_idx) in \
+                                    enumerate(zip(bm_edges_ccw_per_verts, inside_vert_indices)) \
+                                    if any([bme.other_vert(obj.bm.verts(v_idx)).is_boundary \
+                                    for bme in bm_edges_ccw])]
+        indices_deep_inside = [idx for idx in range(len(inside_vert_indices)) \
+                                if idx in indices_near_boundary]
+        
+        # At first, change order of sorted edges around vertices near boundary
+        crease_indices = [[] for i in len(inside_vert_indices)]
+        for idx, bm_edges_ccw in enumerate(bm_edges_ccw_per_verts):
+            if not idx in indices_near_boundary:
+                continue
+            bm_vert = obj.bm.verts(inside_vert_indices[idx])
+            is_candidate = [not bm_edge.other_vert(bm_vert).is_boundary and \
+                            bm_edges_ccw[(i+1)%len(bm_edges_ccw)].other_vert(bm_vert).is_boundary \
+                            for i, bm_edge in enumerate(bm_edges_ccw)]
+            
+            top_index = is_candidate.index(True) if is_candidate.count(True) > 0 else 0
+            rolled_bm_e = np.roll(np.array([bm_e for bm_e in bm_edges_ccw]), \
+                                -top_index).tolist()
+            crease_indices[idx] = [crease_lines.edges.index(obj.bm_to_obj_edge_index(bm_e)) \
+                                    for bm_e in rolled_bm_e]
+                                    
+        # Next, change order of sorted edges around vertices deep inside
+        for idx, bm_edges_ccw in enumerate(bm_edges_ccw_per_verts):
+            if idx in indices_near_boundary:
+                continue
+        """
+        
+    # function to get crease lines around the vertex
+    # https://blender.stackexchange.com/questions/92406/circular-order-of-edges-around-vertex
+    @classmethod
+    def __GetCreaseLinesAroundVertexEx(cls, crease_lines, obj, vertexIndex):
+        
+        bm_vert = obj.bm.verts[vertexIndex]
+        bm_vert.link_edges.index_update()
+        
+        edges_counterclockwise_order = []
+        bm_edge = bm_vert.link_edges[0]
+        # bm_edge = cls.__judgeFirstEdge(bm_vert)
+        other_verts = []
+        while bm_edge not in edges_counterclockwise_order:
+            edges_counterclockwise_order.append(bm_edge)
+            bm_edge = cls.__GetRightSideEdgeAroundVertex(bm_edge, bm_vert, obj)
+            if bm_edge.other_vert(bm_vert) is not None:
+                other_verts.append(bm_edge.other_vert(bm_vert).index)
+        other_verts = np.roll(np.array(other_verts), 1).tolist()
+        
+        edge_indices = [obj.bm_to_obj_edge_index(bm_e) \
+                                        for bm_e in edges_counterclockwise_order]
+        crease_edge_indices = [crease_lines.edges.index(obj.edges[idx]) for idx in edge_indices]
+
+        if all([not obj.bm.verts[i].is_boundary for i in other_verts]):
+            # distances = [(obj.bm.verts[ov].co - Vector([0,0,0])).length for ov in other_verts]
+            # print("other_verts:", other_verts)
+            # print("crease_edge_indices(before roll):", [crease_lines.edges[i] for i in crease_edge_indices])
+            # min_index = distances.index(min(distances))
+            # crease_edge_indices = np.roll(np.array(crease_edge_indices), -min_index).tolist()
+            
+            # obj_edges = [crease_lines.edges[i] for i in crease_edge_indices]
+            # print("all not boundary crease_edge_indices:", obj_edges)
+            print("")
+        else:
+            count = 0
+            while other_verts[0] in cls.indices:
+                other_verts = np.roll(np.array(other_verts), -1).tolist()
+                crease_edge_indices = np.roll(np.array(crease_edge_indices), -1).tolist()
+                count += 1
+                if count >= len(other_verts):
+                    break
+                
+            count = 0
+            while other_verts[0] not in cls.indices:
+                other_verts = np.roll(np.array(other_verts), -1).tolist()
+                crease_edge_indices = np.roll(np.array(crease_edge_indices), -1).tolist()
+                count += 1
+                if count >= len(other_verts):
+                    break
+
+        return crease_edge_indices
+    
+    @classmethod
+    def __judgeFirstEdge(cls, bm_vertex):
+        target = bm_vertex.link_edges[0]
+        max_inner_product = -1
+        base = Vector([1, 0, 0])
+        for bm_e in bm_vertex.link_edges:
+            inner_product = (bm_e.other_vert(bm_vertex).co - bm_vertex.co).normalized().dot(base)
+            if inner_product >= max_inner_product:
+                if inner_product == max_inner_product and \
+                    target.other_vert(bm_vertex).co[1] > bm_e.other_vert(bm_vertex).co[1]:
+                        continue
+                max_inner_product = inner_product
+                target = bm_e
+        return target
+    
+    # Return the right edge of param edge regard to param vertex
+    @classmethod
+    def __GetRightSideEdgeAroundVertex(cls, bm_edge, bm_vertex, obj):
+        for loop in bm_edge.link_loops:
+            if loop.vert == bm_vertex:
+                break
+        return loop.link_loop_prev.edge
 
     # function to calc theta angles between crease lines
     @classmethod
@@ -168,19 +332,19 @@ class FoldAngleCalculator:
     
     # function to calculate fold angles of each crease lines
     @classmethod
-    def CalcFoldAngle(cls, delta_step, crease_lines, inside_vertices, \
-                        dest_valley_angle, dest_mountain_angle):
+    def CalcFoldAngle(cls, step_count, crease_lines, inside_vertices):
         # rho angles of crease edges (updated in each steps)
-        cls.current_rhos = np.zeros((len(crease_lines.edges)))
-        
-        # calculate loop count from delta_step
-        min_angle = min(abs(dest_valley_angle), abs(dest_mountain_angle))
-        loop = math.ceil(min_angle/delta_step)
+        # cls.current_rhos = np.zeros((len(crease_lines.edges)))
+        cls.current_rhos = np.array([angle for angle in crease_lines.angles])
 
-        for count in range(1, (loop+1)):
-            target_v_angle = (dest_valley_angle/loop)*count if count < loop else dest_valley_angle
-            target_m_angle = -(dest_mountain_angle/loop)*count if count < loop else -dest_mountain_angle
-            
+        diffs = [target - angle for target, angle \
+                in zip(crease_lines.target_angles, crease_lines.angles)]
+        for loop in range(0, max(0, step_count)):
+            target_angles = np.array([angle + (diff/step_count) * (loop + 1) \
+                                    if loop < (step_count - 1) else target \
+                                    for angle, diff, target in zip(crease_lines.angles, \
+                                    diffs, crease_lines.target_angles)])
+
             C = np.zeros((3*len(inside_vertices), len(crease_lines.edges)))
             r = np.zeros(3*len(inside_vertices))
             
@@ -225,17 +389,11 @@ class FoldAngleCalculator:
 
             Cp = np.linalg.pinv(C)
             In = np.identity(len(crease_lines.edges))
-            dr = np.zeros(len(crease_lines.edges))
-            for i in range(len(dr)):
-                dr[i] = (target_v_angle \
-                        if crease_lines.is_valleys[i] else target_m_angle) \
-                        - cls.current_rhos[i]
-                        
-            # use this adjustment only if step count == 1
-            adjustment = -np.dot(Cp, r.T) \
-                    if step >= max(abs(dest_valley_angle), abs(dest_mountain_angle)) \
-                    else np.zeros(len(crease_lines.edges)).T
-            # adjustment = -np.dot(Cp, r.T)
+            dr = target_angles - cls.current_rhos
+            
+            # use this adjustment only if step count == 1 considering error range
+            adjustment = -np.dot(Cp, r.T) if step_count == 1 \
+                            else np.zeros(len(crease_lines.edges)).T
             
             dr_actual = adjustment + np.dot((In - np.dot(Cp, C)), dr.T)
             cls.current_rhos += dr_actual
@@ -298,12 +456,12 @@ class FaceRotation:
     
     # function to get neighbor faces
     def get_neighbors(self, faces):
-        neighbors = [f for e_key in self.face.edge_keys \
+        neighbors = [f for e in self.face.edges \
                         for f in faces \
-                        if (f.index != self.face.index) and (e_key in f.edge_keys)]
-        hinges = [e_key for e_key in self.face.edge_keys \
-                        for f in faces \
-                        if (f.index != self.face.index) and (e_key in f.edge_keys)]
+                        if (f.index != self.face.index) and (e in f.edges)]
+        hinges = [tuple(sorted([e.verts[0].index, e.verts[1].index])) \
+                        for e in self.face.edges for f in faces \
+                        if (f.index != self.face.index) and (e in f.edges)]
         return neighbors, hinges
 
     # function to rotate all faces
@@ -312,8 +470,8 @@ class FaceRotation:
         # use deque to process rotating faces
         face_que = deque()
         
-        for face in cls.obj.faces:
-            if face.index == cls.fixed_face_index:
+        for face in cls.obj.bm.faces:
+            if cls.obj.bm_to_obj_face_index(face) == cls.fixed_face_index:
                 face_que.appendleft(FaceRotation(face))
                 break
 
@@ -323,26 +481,28 @@ class FaceRotation:
         while len(face_que) > 0:
             face_rot = face_que.pop()
             
-            if not rotated[face_rot.face.index]:
+            if not rotated[cls.obj.bm_to_obj_face_index(face_rot.face)]:
                 # rotate face with quaternion
                 rotated_indices, rotated_verts = cls.__rotate_face(face_rot)
-                print("face_rot.face.index:", face_rot.face.index)
-                print("face_rot.prev_face_idx:", face_rot.prev_face_idx)
-                print("rotate angles:", face_rot.rot_angles)
+                # print("face_rot.prev_face_idx:", face_rot.prev_face_idx)
+                # print("rotate angles:", face_rot.rot_angles)
                 for i, v in enumerate(rotated_verts):
                     verts_out[rotated_indices[i]] = v
-                rotated[face_rot.face.index] = True
+                rotated[cls.obj.bm_to_obj_face_index(face_rot.face)] = True
             
             # find neighbor faces
-            neighbors, hinges = face_rot.get_neighbors(cls.obj.faces)
+            neighbors, hinges = face_rot.get_neighbors(cls.obj.bm.faces)
             for i, neighbor in enumerate(neighbors):
-                if rotated[neighbor.index]:
+                if rotated[cls.obj.bm_to_obj_face_index(neighbor)]:
                     continue
                 
+                # print("face_rot.neighbor.index:", cls.obj.bm_to_obj_face_index(neighbor))
                 n_rot = FaceRotation(neighbor)
                 # load vector, angle and inside vertex related to this rotation        
                 vec, rad, iv = cls.__get_edge_vector_angle(neighbor, hinges[i], cls.obj.verts)
                 
+                if rad > 1.:
+                    print("face_rot.neighbor vec:", vec, " rad:", rad, "iv:", iv)
                 # make quaternion to rotate the target face
                 shift_quat_left = [[1,0,0,-iv[0]], [0,1,0,-iv[1]], [0,0,1,-iv[2]], \
                                     [0,0,0,1]]
@@ -360,7 +520,7 @@ class FaceRotation:
                 for idx in face_rot.prev_face_idx:
                     n_rot.prev_face_idx.append(idx)
                 n_rot.rot_angles.append(rad)
-                n_rot.prev_face_idx.append(face_rot.face.index)
+                n_rot.prev_face_idx.append(cls.obj.bm_to_obj_face_index(face_rot.face))
 
                 
                 # put new face
@@ -388,12 +548,14 @@ class FaceRotation:
             # get rotation radian
             crease_idx = cls.crease_lines.edges.index(edge)
             local_idx = cls.inside_vertices[iv_idx].crease_indices.index(crease_idx)
-            rad = cls.inside_vertices[iv_idx].rhos[local_idx]
+            rad = cls.inside_vertices[iv_idx].rhos[local_idx] - \
+                    cls.inside_vertices[iv_idx].init_rhos[local_idx]
             
             # check rotation orientation comparing with another neighbor edge
-            for e in face.edge_keys:
-                if e != edge and e in cls.crease_lines.edges:
-                    e_cr_idx = cls.crease_lines.edges.index(e)
+            for bm_e in face.edges:
+                obj_e = tuple(sorted([bm_e.verts[0].index, bm_e.verts[1].index]))
+                if obj_e != edge and obj_e in cls.crease_lines.edges:
+                    e_cr_idx = cls.crease_lines.edges.index(obj_e)
                     if not e_cr_idx in cls.inside_vertices[iv_idx].crease_indices:
                         continue
                     e_l_idx = cls.inside_vertices[iv_idx].crease_indices.index(e_cr_idx)
@@ -403,12 +565,12 @@ class FaceRotation:
                     else:
                         sign = e_l_idx - local_idx
 
-                    rad *= sign
+                    rad = rad * sign
                     break
         else:
             # center of target polygon
-            poly_center = np.array([face.center[0], face.center[1], face.center[2]])
-            
+            center = face.calc_center_median()
+            poly_center = np.array([center[0], center[1], center[2]])
             # cross product between 'edge[1] - edge[0]' and 'center - edge[0]'
             va = poly_center - verts[edge[0]]
             vb = verts[edge[1]] - verts[edge[0]]
@@ -418,7 +580,7 @@ class FaceRotation:
 
             rad = 0.0
             if cls.crease_lines.edges.count(edge) > 0:
-                rad = cls.crease_lines.angles[cls.crease_lines.edges.index(edge)]
+                rad = cls.crease_lines.delta_angles[cls.crease_lines.edges.index(edge)]
                 rad *= -1 if np.dot(n, face_n) > 0 else 1
             return vb, rad, verts[edge[0]]
             
@@ -428,12 +590,12 @@ class FaceRotation:
     # function to rotate a face
     @classmethod
     def __rotate_face(cls, face_rot):
-        v_indices = [v_idx for v_idx in face_rot.face.vertices]
+        v_indices = [v.index for v in face_rot.face.verts]
         
         rotated_verts = []
-        for v_idx in face_rot.face.vertices:
+        for v in face_rot.face.verts:
             # rotate source vertex using quaternion            
-            source_q = np.array([cls.obj.verts[v_idx][0], cls.obj.verts[v_idx][1], cls.obj.verts[v_idx][2], 1])
+            source_q = np.array([cls.obj.verts[v.index][0], cls.obj.verts[v.index][1], cls.obj.verts[v.index][2], 1])
             vq = np.dot(face_rot.rot_quat, source_q.T)
             v_result = np.array([vq[0], vq[1], vq[2]])
             rotated_verts.append(v_result)
@@ -460,35 +622,23 @@ class FaceRotation:
 
 #################################
 
-# create tuple list to avoid type mismatch
-valley_edges = [tuple(sorted(e)) for e in valleys if type(e) is tuple] 
-mountain_edges = [tuple(sorted(e)) for e in mountains if type(e) is tuple] 
-if len(valleys) > 0 and type(valleys[0]) is list:
-    valley_edges = [tuple(sorted(e)) for e in valleys]
-    mountain_edges = [tuple(sorted(e)) for e in mountains]
 # wrap object
-obj = ObjectParams(obj_in)
+obj = ObjectParams(verts_in, edges_in, faces_in)
 
 # extract crease lines
-crease_lines = CreaseLines(obj.edges, \
-                valley_edges, mountain_edges)
+crease_lines = CreaseLines(obj, fold_edge_indices, fold_edge_angles, folding)
+print("crease_lines.edges:", crease_lines.edges)
+print("crease_lines.target_angles:", crease_lines.target_angles)
 
 # extract inside vertices
 inside_vertices = InsideVertex.GenerateInsideVertices( \
-                    obj, crease_lines.edges, \
-                    valley_edges, mountain_edges)
-
-# define loop count to calculate angles
-min_angle = min(abs(valley_angle)*folding, abs(mountain_angle)*folding)
-loop = int((min_angle/step) + 1)
-
+                    obj, crease_lines)
 # calculation loop to determine the final angles
-FoldAngleCalculator.CalcFoldAngle(step, crease_lines, inside_vertices, \
-                                valley_angle*folding, mountain_angle*folding)
-crease_lines.angles = FoldAngleCalculator.current_rhos
-print("crease_lines.edges:", crease_lines.edges)
-print("crease_lines.is_valleys:", crease_lines.is_valleys)
-print("crease_lines.angles:", crease_lines.angles)
+FoldAngleCalculator.CalcFoldAngle(step, crease_lines, inside_vertices)
+
+crease_lines.delta_angles = [cur_rho - angle for cur_rho, angle \
+            in zip(FoldAngleCalculator.current_rhos, crease_lines.angles)]
+print("crease_lines.delta_angles:", crease_lines.delta_angles)
 
 # rotate each faces using final angles
 FaceRotation.obj = obj
@@ -497,13 +647,12 @@ FaceRotation.crease_lines = crease_lines
 FaceRotation.fixed_face_index = int(fixed_face)
 verts_out = FaceRotation.RotateFaces()
 
-verts = Vector3DList()
-for v in verts_out:
-    verts.append(Vector([v[0], v[1], v[2]]))
-edges = [e.vertices for e in obj_in.data.edges]
-faces = PolygonIndicesList.fromValues([f.vertices for f in obj.faces])
+verts = [Vector([v[0], v[1], v[2]]) for v in verts_out]
+edges = obj.edges
+faces = obj.faces
+"""
 
-
-# verts = [verts_out]
-# edges = [obj.edges]
-# faces = [[list(f.vertices) for f in obj.faces]]
+verts = []
+edges = []
+faces = []
+"""
