@@ -43,6 +43,14 @@ class ObjectParams:
         self.bm.verts.ensure_lookup_table()
         self.bm.normal_update()
     
+    def free(self):
+        if self.mesh is not None:
+            bpy.data.meshes.remove(self.mesh)
+            self.mesh = None
+        if self.bm is not None:
+            self.bm.free()
+            self.bm = None
+
     # Get the object-edge index from a bmesh edge
     def bm_to_obj_edge_index(self, bm_edge):
         edge = tuple(sorted([bm_edge.verts[0].index, bm_edge.verts[1].index])) 
@@ -527,31 +535,36 @@ class FaceRotation:
         return R
 
 #################################
-# Wrap object
-obj = ObjectParams(verts_in, edges_in, faces_in)
+obj = None
+try:
+    # Wrap object
+    obj = ObjectParams(verts_in, edges_in, faces_in)
 
-# Extract crease lines
-crease_lines = CreaseLines(obj, fold_edge_indices, fold_edge_angles, folding)
+    # Extract crease lines
+    crease_lines = CreaseLines(obj, fold_edge_indices, fold_edge_angles, folding)
 
-verts_out = obj.verts.tolist()
-if len(fold_edge_indices) > 0:
-    # Extract inside vertices
-    inside_vertices = InsideVertex.GenerateInsideVertices( \
-                        obj, crease_lines)
-    # Calculation loop to determine the final angles
-    FoldAngleCalculator.CalcFoldAngle(step, crease_lines, inside_vertices)
+    verts_out = obj.verts.tolist()
+    if len(fold_edge_indices) > 0:
+        # Extract inside vertices
+        inside_vertices = InsideVertex.GenerateInsideVertices( \
+                            obj, crease_lines)
+        # Calculation loop to determine the final angles
+        FoldAngleCalculator.CalcFoldAngle(step, crease_lines, inside_vertices)
 
-    crease_lines.delta_angles = [cur_rho - angle for cur_rho, angle \
-                in zip(FoldAngleCalculator.current_rhos, crease_lines.angles)]
+        crease_lines.delta_angles = [cur_rho - angle for cur_rho, angle \
+                    in zip(FoldAngleCalculator.current_rhos, crease_lines.angles)]
 
-    # Rotate each faces using final angles
-    FaceRotation.obj = obj
-    FaceRotation.inside_vertices = inside_vertices
-    FaceRotation.crease_lines = crease_lines
-    FaceRotation.fixed_face_index = int(fixed_face)
-    verts_out = FaceRotation.RotateFaces()
+        # Rotate each faces using final angles
+        FaceRotation.obj = obj
+        FaceRotation.inside_vertices = inside_vertices
+        FaceRotation.crease_lines = crease_lines
+        FaceRotation.fixed_face_index = int(fixed_face)
+        verts_out = FaceRotation.RotateFaces()
 
-verts = [Vector([v[0], v[1], v[2]]) for v in verts_out]
-edges = obj.edges
-faces = obj.faces
+    verts = [Vector([v[0], v[1], v[2]]) for v in verts_out]
+    edges = obj.edges
+    faces = obj.faces
+finally:
+    if obj is not None:
+        obj.free()
 
